@@ -1,5 +1,6 @@
 import copy
 import os
+import shutil
 from tqdm import tqdm
 import numpy as np
 
@@ -8,10 +9,13 @@ from trl import DataCollatorForCompletionOnlyLM
 from peft import get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict, prepare_model_for_kbit_training, PeftModel
 
 from utils import *
+from utils.warning_suppressor import suppress_training_warnings
 from federated_learning import *
-from federated_learning.fed_lora_classifier import Evaluation, FedLoRAClassifier
+from lora_classifier.fed_lora_classifier import Evaluation, FedLoRAClassifier
 from config import get_config, save_config, get_model_config, get_training_args, set_lora_init_seed
 
+
+suppress_training_warnings()
 
 # ===== Define the arguments =====
 script_args, fed_args, peft_config = get_config()
@@ -26,7 +30,7 @@ else:
         clf = FedLoRAClassifier.instance(
             getattr(script_args, 'prefilter_classifier_path', None)
         )
-        print(f"[prefilter] LoRA classifier enabled (mode={clf.lora_mode}).")
+        print("[prefilter] LoRA classifier enabled (mode=delta).")
 
         norm = str(getattr(clf, 'normalize', 'none')).lower().replace('-', '_')
         script_args.normalization_method = ('l2' if norm == 'l2' else 'none')
@@ -58,7 +62,7 @@ device_map, quantization_config, _ = get_model_config(script_args)
 load_kwargs = dict(
     quantization_config=quantization_config,
     device_map=device_map,
-    trust_remote_code=script_args.trust_remote_code,
+    trust_remote_code=True,
 )
 
 try:
@@ -109,6 +113,7 @@ data_collator = DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer
 # ===== Start federated training =====
 training_loss = [[] for i in range(fed_args.num_clients)]
 prefilter_strategy = PrefilterStrategy(script_args, fed_args)
+strategy_name = str(getattr(script_args, 'prefilter_strategy', 'step-level')).lower()
 
 for round in tqdm(range(fed_args.num_rounds)):
     clients_this_round = get_clients_this_round(fed_args, round)
@@ -130,7 +135,6 @@ for round in tqdm(range(fed_args.num_rounds)):
         new_lr = cosine_learning_rate(round, fed_args.num_rounds, script_args.learning_rate, 1e-6)
         training_args = get_training_args(script_args, new_lr)
 
-        strategy_name = str(getattr(script_args, 'prefilter_strategy', 'step-level')).lower()
         trainer = get_fed_local_sft_trainer(
             model=model,
             tokenizer=tokenizer,
@@ -145,7 +149,7 @@ for round in tqdm(range(fed_args.num_rounds)):
             global_auxiliary=global_auxiliary,
             current_round=round,  
             tracker_initial_state=None,
-            tracker_enabled=(getattr(script_args, 'prefilter_enable', False) and strategy_name != 'shadow-level'),
+            tracker_enabled=(enable and strategy_name not in ('shadow-level', 'evidence-level')),
             client_id=client
         )
 
@@ -158,8 +162,9 @@ for round in tqdm(range(fed_args.num_rounds)):
         else:
             local_dict_list[client] = copy.deepcopy(get_peft_model_state_dict(model))   # copy is needed!
 
-        # ===== Shadow-level: run shadow training with fixed initial LoRA and save params =====
-        if getattr(script_args, 'prefilter_enable', False) and strategy_name == 'shadow-level':
+        # ===== Shadow branch: conditionally run with fixed initial LoRA for detection =====
+        use_shadow = enable and prefilter_strategy.use_shadow(client, round)
+        if use_shadow:
             try:
                 set_peft_model_state_dict(model, shadow_lora_base)
                 shadow_fixed_lr = 5e-5
@@ -186,102 +191,85 @@ for round in tqdm(range(fed_args.num_rounds)):
                 print(f"[warn] Shadow-level training failed: {se}")
 
     # ===== Prefilter: Detect harmful samples and adjust weights based on malicious ratio =====
-    filtered_clients_this_round = clients_this_round.copy()  # Keep all clients for aggregation
     client_harmful_mapping = {}
+    eval_result = {}
     
-    if getattr(script_args, 'prefilter_enable', False):
-        try:
-            # Get the mapping of harmful samples to their corresponding clients
-            clf_local = FedLoRAClassifier.instance()
-            client_harmful_mapping, eval_result = clf_local.get_harmful_mapping(
-                params_dir=os.path.join(script_args.output_dir, 'fed_lora_params', f'round_{round+1}'),
-                clients_this_round=clients_this_round,
-                round_num=round,
-                fed_args=fed_args,
-                script_args=script_args
-            )
-            
-            # Save prefilter results before aggregation
+    if enable:
+        need_classifier = any(prefilter_strategy.use_shadow(c, round) for c in clients_this_round)
+        if not need_classifier and strategy_name in ('step-level', 'client-level'):
+            pr = getattr(script_args, 'prefilter_round', None)
+            need_classifier = (pr is None) or (int(round) < int(pr))
+        if need_classifier:
+            params_dir = os.path.join(script_args.output_dir, 'fed_lora_params', f'round_{round+1}')
             try:
-                eval_engine = Evaluation(FedLoRAClassifier.instance())
-                _, current_precision = eval_engine.evaluate(
-                    params_dir=os.path.join(script_args.output_dir, 'fed_lora_params', f'round_{round+1}'),
-                    output_dir=script_args.output_dir,
+                clf_local = FedLoRAClassifier.instance()
+                client_harmful_mapping, eval_result = clf_local.get_harmful_mapping(
+                    params_dir=params_dir,
+                    clients_this_round=clients_this_round,
                     round_num=round,
-                    mode='prefilter',
-                    print_stats=False,
-                    existing_result=eval_result,
-                    threshold=getattr(script_args, 'prefilter_threshold', None)
+                    fed_args=fed_args,
+                    script_args=script_args
                 )
-                print(f">> Round {round+1} Classifier Precision: {current_precision*100:.2f}%")
-                # Delete the LoRA parameter files of the current round after evaluation to save space.
-                try:
-                    current_round_params_dir = os.path.join(script_args.output_dir, 'fed_lora_params', f'round_{round+1}')
-                    import shutil
-                    if os.path.exists(current_round_params_dir):
-                        shutil.rmtree(current_round_params_dir)
-                except Exception as ce:
-                    print(f"[warn] Cleanup after evaluation failed: {ce}")
-            except Exception as e:
-                print(f"[warn] Failed to save prefilter classification results: {e}")
-                current_precision = 0.0
-            
-            filtered_clients_this_round, client_effective_samples, skip_round = prefilter_strategy.compute(
-                round,
-                clients_this_round,
-                client_actual_samples,
-                client_harmful_mapping,
-                eval_result
-            )
-        except Exception as e:
-            print(f"[warn] Prefilter failed, proceeding with all clients: {e}")
-            client_harmful_mapping = {}
-            client_effective_samples = {}
-            for c in clients_this_round:
-                base_samples = client_actual_samples.get(c, 0)
-                client_effective_samples[c] = float(base_samples)
-            try:
-                sum_weighted = sum(float(client_effective_samples[c]) for c in clients_this_round)
-            except Exception:
-                sum_weighted = 0.0
-            skip_round = (sum_weighted == 0.0)
-            client_current_weights = {c: 1.0 for c in clients_this_round}
-            client_malicious_ratio = {c: 0.0 for c in clients_this_round}
-            prefilter_strategy._log(round, clients_this_round, client_current_weights, client_effective_samples, client_actual_samples, client_malicious_ratio=client_malicious_ratio)
-    else:
-        filtered_clients_this_round = clients_this_round.copy()
-        client_effective_samples = {}
-        for c in clients_this_round:
-            base_samples = client_actual_samples.get(c, 0)
-            client_effective_samples[c] = float(base_samples)
-        try:
-            sum_weighted = sum(float(client_effective_samples[c]) for c in clients_this_round)
-        except Exception:
-            sum_weighted = 0.0
-        skip_round = (sum_weighted == 0.0)
 
-    try:
-        for c in clients_this_round:
-            base_samples = client_actual_samples.get(c, 0)
-            eff = float(client_effective_samples[c])
-            w = (eff / float(base_samples)) if base_samples > 0 else 0.0
+                try:
+                    eval_engine = Evaluation(FedLoRAClassifier.instance())
+                    _, current_precision = eval_engine.evaluate(
+                        params_dir=params_dir,
+                        output_dir=script_args.output_dir,
+                        round_num=round,
+                        mode='prefilter',
+                        print_stats=False,
+                        existing_result=eval_result,
+                        threshold=getattr(script_args, 'prefilter_threshold', None)
+                    )
+                    print(f">> Round {round+1} Classifier Precision: {current_precision*100:.2f}% ")
+                except Exception as e:
+                    print(f"[warn] Failed to save prefilter classification results: {e}")
+                # Delete LoRA params after evaluation
+                if os.path.exists(params_dir):
+                    shutil.rmtree(params_dir)
+            except Exception as e:
+                print(f"[warn] Classifier unavailable, using strategy fallback: {e}")
+
+    filtered_clients_this_round, client_effective_samples, skip_round = prefilter_strategy.compute(
+        round,
+        clients_this_round,
+        client_actual_samples,
+        client_harmful_mapping,
+        eval_result
+    )
+
+    for c in clients_this_round:
+        base_samples = client_actual_samples.get(c, 0)
+        eff = float(client_effective_samples.get(c, 0))
+        w = (eff / float(base_samples)) if base_samples > 0 else 0.0
+
+        status, frozen_w = prefilter_strategy.get_frozen_info(c)
+        if status == 'malicious':
+            print(f"[prefilter] Client {c} frozen MALICIOUS | weight={w:.3f}")
+        elif status == 'benign':
+            print(f"[prefilter] Client {c} frozen BENIGN | weight={w:.3f}")
+        else:
             harm_cnt = len(client_harmful_mapping.get(c, []))
             print(f"[prefilter] Client {c} has {harm_cnt} harmful steps | weight={w:.3f}")
-    except Exception as pe:
-        print(f"[warn] Printing client weights failed: {pe}")
 
     # =====  Server-side aggregation and checkpoint logic =====
     save_steps = 10 if script_args.existing_lora is not None else 50
 
+    def _save_checkpoint(set_state=False):
+        if not (((round + 1) % save_steps == 0) or ((round + 1) == int(getattr(fed_args, 'num_rounds', 0))) or ((round + 1) == 10)):
+            return
+        if set_state:
+            set_peft_model_state_dict(model, global_dict)
+        ckpt_dir = os.path.join(script_args.output_dir, f"checkpoint-{round+1}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        model.save_pretrained(ckpt_dir)
+        tokenizer.save_pretrained(ckpt_dir)
+
     if skip_round:
         print(f">> Round {round+1} skipped. Global model unchanged.")
         try:
-            if ((round + 1) % save_steps == 0) or ((round + 1) == int(getattr(fed_args, 'num_rounds', 0))) or ((round + 1) == 10):
-                set_peft_model_state_dict(model, global_dict)
-                ckpt_dir = os.path.join(script_args.output_dir, f"checkpoint-{round+1}")
-                os.makedirs(ckpt_dir, exist_ok=True)
-                model.save_pretrained(ckpt_dir)
-                tokenizer.save_pretrained(ckpt_dir)
+            _save_checkpoint(set_state=True)
         except Exception as se:
             print(f"[warn] Final checkpoint save failed: {se}")
         continue
@@ -293,11 +281,6 @@ for round in tqdm(range(fed_args.num_rounds)):
     )
     set_peft_model_state_dict(model, global_dict)   # Update global model
 
-    # ===== Save the model =====
-    if ((round + 1) % save_steps == 0) or ((round + 1) == int(getattr(fed_args, 'num_rounds', 0))) or ((round + 1) == 10):
-        ckpt_dir = os.path.join(script_args.output_dir, f"checkpoint-{round+1}")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        model.save_pretrained(ckpt_dir)
-        tokenizer.save_pretrained(ckpt_dir)
+    _save_checkpoint()
 
     np.save(os.path.join(script_args.output_dir, "training_loss.npy"), np.array(training_loss))

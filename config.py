@@ -4,6 +4,7 @@ from transformers import HfArgumentParser, TrainingArguments, BitsAndBytesConfig
 from peft import LoraConfig
 import os
 import json
+import random
 from accelerate import Accelerator
 import torch
 import numpy as np
@@ -32,6 +33,7 @@ class FedArguments:
 class ScriptArguments:
 
     model_name_or_path: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
+    # dataset_name: Optional[str] = field(default="lucasmccabe-lmi/CodeAlpaca-20k", metadata={"help": "the dataset name"})
     log_with: Optional[str] = field(default="none", metadata={"help": "use 'wandb' to log with wandb"})
     learning_rate: Optional[float] = field(default=5e-5, metadata={"help": "the learning rate"})    # aligned with single_sample_training.py
     batch_size: Optional[int] = field(default=16, metadata={"help": "the batch size"})
@@ -41,7 +43,6 @@ class ScriptArguments:
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
     load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
     use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters - aligned with single_sample_training.py"})
-    trust_remote_code: Optional[bool] = field(default=True, metadata={"help": "Enable `trust_remote_code`"})
     output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
     peft_lora_r: Optional[int] = field(default=8, metadata={"help": "the r parameter of the LoRA adapters"})
     peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
@@ -61,10 +62,11 @@ class ScriptArguments:
     time_decay_factor: Optional[float] = field(default=0.95, metadata={"help": "Bayes time decay factor"})
     prefilter_min_weight: Optional[float] = field(default=0.0, metadata={"help": "Minimum soft weight for clients"})
     prefilter_log_mode: Optional[str] = field(default="json", metadata={"help": "Logging mode for prefilter weights: 'json' or 'ndjson'"})
-    prefilter_strategy: Optional[str] = field(default="none", metadata={"help": "Prefilter weight strategy selector: 'step-level', 'client-level', 'shadow-level', or 'none' (evaluate only)"})
+    prefilter_strategy: Optional[str] = field(default="none", metadata={"help": "Prefilter weight strategy selector: 'step-level', 'client-level', 'shadow-level', 'evidence-level', or 'none'"})
     prefilter_round: Optional[int] = field(default=20, metadata={"help": "Only apply filtering/weight adjustment for first N rounds; then freeze"})
     prefilter_id: Optional[bool] = field(default=False, metadata={"help": "Enable dataset-specific sample_id threshold filtering (malicious<2500, benign<4000)"})
     prefilter_skip_avg_weight: Optional[float] = field(default=0.2, metadata={"help": "Skip aggregation when average client weight in a round < this threshold (vector/shadow-level)"})
+    audit_interval: Optional[int] = field(default=5, metadata={"help": "Number of rounds between audits for frozen benign clients (evidence-level)"})
 
 parser = HfArgumentParser((ScriptArguments, FedArguments))
 script_args, fed_args = parser.parse_args_into_dataclasses()
@@ -83,11 +85,10 @@ else:
 
 #===== Set LoRA parameter initialization seed =====
 def set_lora_init_seed(seed: int = 2025):
-    import random as _random
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    _random.seed(seed)
+    random.seed(seed)
     np.random.seed(seed)
 
 def get_config():
