@@ -3,7 +3,6 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -11,15 +10,13 @@ import torch.nn as nn
 from tqdm import tqdm
 
 # Dataset and Label Configuration
-malicious_dataset = {"BeaverTails", "MaliciousGen"}
+malicious_dataset = {"BeaverTails", "MaliciousGen"}  
 benign_dataset = {"WildChat", "lmsys-chat-1m"}
 ALL_DATASETS = malicious_dataset | benign_dataset
 DATASET_PATTERNS = list(ALL_DATASETS)
 
-
 def get_label_map() -> Dict[str, List[str]]:
     return {"harmful": list(malicious_dataset), "harmless": list(benign_dataset)}
-
 
 # Logging, Dataset Path Checks, and Device Selection
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
@@ -29,7 +26,6 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     return logging.getLogger(__name__)
-
 
 def validate_dataset_dir(dataset_dir: str) -> None:
     base = Path(dataset_dir)
@@ -77,7 +73,6 @@ def load_single_state_dict(pt_path: str) -> Optional[Dict[str, torch.Tensor]]:
         return None
 
 
-
 def load_state_dicts(
     pairs: List[Tuple[str, str]], max_workers: int = 4
 ) -> Tuple[List[Dict[str, torch.Tensor]], List[str]]:
@@ -85,21 +80,19 @@ def load_state_dicts(
     n = len(pairs)
     state_dicts_buffer: List[Optional[Dict[str, torch.Tensor]]] = [None] * n
     ds_labels_buffer: List[Optional[str]] = [None] * n
-    index_by_path: Dict[str, int] = {path: idx for idx, (_, path) in enumerate(pairs)}
-    dataset_counts: Dict[str, int] = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(load_single_state_dict, path): (ds, path) for ds, path in pairs}
+        futures = {
+            executor.submit(load_single_state_dict, path): (idx, ds, path)
+            for idx, (ds, path) in enumerate(pairs)
+        }
         for f in tqdm(as_completed(futures), total=n, desc="Loading parameters", unit="sample"):
-            ds, path = futures[f]
+            idx, ds, path = futures[f]
             try:
                 sd = f.result()
-                idx = index_by_path.get(path, None)
-                if sd is not None and idx is not None:
+                if sd is not None:
                     state_dicts_buffer[idx] = sd
                     ds_labels_buffer[idx] = ds
-                    dataset_counts.setdefault(ds, 0)
-                    dataset_counts[ds] += 1
             except Exception as e:
                 logging.warning(f"Failed to load {path}: {e}")
 
@@ -115,7 +108,6 @@ def load_state_dicts(
 
     logging.info(f"Successfully loaded {len(state_dicts)} parameter files")
     return state_dicts, ds_labels
-
 
 
 def find_param_files(output_dir: str, patterns: Optional[List[str]] = None) -> List[Tuple[str, str]]:
@@ -143,7 +135,6 @@ def find_param_files(output_dir: str, patterns: Optional[List[str]] = None) -> L
     return pairs
 
 
-
 def extract_step_id_from_path(pt_path: str) -> Optional[int]:
     s = str(pt_path)
     m = re.search(r"step_(\d+)", s)
@@ -164,21 +155,19 @@ def extract_round_from_path(pt_path: str) -> int | None:
                 return None
     return None
 
-
-
 # Layer Filtering and Feature Matrix Construction
-def filter_state_dict_to_first_layer(
-    sd: Dict[str, torch.Tensor], first_idx: int
+def filter_layer_params(
+    sd: Dict[str, torch.Tensor], layer_idx: int
 ) -> Dict[str, torch.Tensor]:
-    """Keep only the parameter keys for the specified first layer."""
+    """Keep only the parameter keys for the specified layer."""
     filtered: Dict[str, torch.Tensor] = {}
-    pattern = rf"layers\.{first_idx}\."
+    pattern = rf"layers\.{layer_idx}\."
     for k, v in sd.items():
         if torch.is_tensor(v) and re.search(pattern, k):
             filtered[k] = v
     return filtered
 
-def detect_first_layer_index(state_dicts: List[Dict[str, torch.Tensor]]) -> int:
+def get_first_layer_idx(state_dicts: List[Dict[str, torch.Tensor]]) -> int:
     """Automatically detect the minimum layer index."""
     indices = [
         int(m.group(1))
@@ -191,29 +180,43 @@ def detect_first_layer_index(state_dicts: List[Dict[str, torch.Tensor]]) -> int:
         raise RuntimeError("Failed to detect any layer index (missing 'layers.<idx>')")
     return min(indices)
 
-
-
-
-
 def apply_filter_policy(
     state_dicts: List[Dict[str, torch.Tensor]],
     layer_idx: int,
     filter_policy: str,
 ) -> List[Dict[str, torch.Tensor]]:
-    """Filter parameters according to the policy, keeping only the specified layer if needed."""
-    if layer_idx < 0:
-        logging.warning("Failed to identify layer index; skipping layer filtering (using all parameters)")
-        return state_dicts
-    first_layer_only = [filter_state_dict_to_first_layer(sd, layer_idx) for sd in state_dicts]
-    b_only: List[Dict[str, torch.Tensor]] = []
-    for sd in first_layer_only:
-        filtered: Dict[str, torch.Tensor] = {}
-        for k, v in sd.items():
-            if torch.is_tensor(v) and k.endswith("lora_B.weight"):
-                filtered[k] = v
-        b_only.append(filtered)
-    return b_only
+    """Filter parameters according to the policy.
 
+    Supported policies:
+      - first_B:   keep only the first layer's lora_B.weight
+      - all_layers: keep lora_A.weight and lora_B.weight from all layers
+    """
+    if filter_policy == "first_B":
+        if layer_idx < 0:
+            logging.warning("Failed to identify layer index; skipping layer filtering (using all parameters)")
+            return state_dicts
+        first_layer_only = [filter_layer_params(sd, layer_idx) for sd in state_dicts]
+        filtered_dicts: List[Dict[str, torch.Tensor]] = []
+        for sd in first_layer_only:
+            b_weights: Dict[str, torch.Tensor] = {}
+            for k, v in sd.items():
+                if torch.is_tensor(v) and k.endswith("lora_B.weight"):
+                    b_weights[k] = v
+            filtered_dicts.append(b_weights)
+        return filtered_dicts
+
+    if filter_policy == "all_layers":
+        filtered_dicts: List[Dict[str, torch.Tensor]] = []
+        for sd in state_dicts:
+            lora_weights: Dict[str, torch.Tensor] = {}
+            for k, v in sd.items():
+                if torch.is_tensor(v) and ("lora_A." in k or "lora_B." in k):
+                    lora_weights[k] = v
+            filtered_dicts.append(lora_weights)
+        return filtered_dicts
+
+    logging.warning(f"Unknown filter_policy '{filter_policy}', returning state_dicts unchanged")
+    return state_dicts
 
 def get_ordered_keys_and_sizes(
     state_dicts: List[Dict[str, torch.Tensor]],
@@ -246,7 +249,6 @@ def get_ordered_keys_and_sizes(
     return ordered_keys, key_sizes, use_intersection, total_dim
 
 
-
 def build_feature_matrix(
     state_dicts: List[Dict[str, torch.Tensor]],
     ordered_keys: List[str],
@@ -267,8 +269,6 @@ def build_feature_matrix(
     return X
 
 
-
-
 # Feature Normalization and Label Generation
 def apply_normalization(
     X: np.ndarray,
@@ -283,12 +283,8 @@ def apply_normalization(
         return X_norm
     return X.astype(np.float32)
 
-
 def generate_labels(ds_labels: List[str]) -> np.ndarray:
     return np.array([1 if ds in malicious_dataset else 0 for ds in ds_labels], dtype=np.float32)
-
-
-
 
 # Classifier Loading / Saving and Evaluation Metrics
 def load_classifier(path: str) -> Dict:
@@ -312,8 +308,6 @@ def save_classifier(classifier_data: Dict, path: str) -> None:
     except Exception as e:
         raise RuntimeError(f"Failed to save classifier: {e}")
 
-
-
 def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     """Compute basic classification metrics."""
     tp = np.sum((y_pred == 1) & (y_true == 1))
@@ -329,45 +323,9 @@ def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float
         "precision": precision,
     }
 
-
-
-def print_dataset_statistics(results: List[Dict], y_pred: np.ndarray, y_true: np.ndarray) -> None:
-    """Print dataset-level statistics."""
-    from collections import defaultdict
-    
-    dataset_counts = defaultdict(int)
-    dataset_harmful_counts = defaultdict(int)
-    dataset_tp = defaultdict(int)
-    dataset_fp = defaultdict(int)
-    
-    for i, r in enumerate(results):
-        ds = r["dataset"]
-        dataset_counts[ds] += 1
-        if r["pred"] == "harmful":
-            dataset_harmful_counts[ds] += 1
-        if (y_pred[i] == 1) and (y_true[i] == 1):
-            dataset_tp[ds] += 1
-        if (y_pred[i] == 1) and (y_true[i] == 0):
-            dataset_fp[ds] += 1
-
-    print("Dataset statistics:")
-    for ds in DATASET_PATTERNS:
-        cnt = dataset_counts.get(ds, 0)
-        if cnt == 0:
-            continue
-        harmful_cnt = dataset_harmful_counts.get(ds, 0)
-        rate = harmful_cnt / cnt if cnt > 0 else 0.0
-        tp_ds = dataset_tp.get(ds, 0)
-        fp_ds = dataset_fp.get(ds, 0)
-        denom = tp_ds + fp_ds
-        prec_ds = (tp_ds / denom) if denom > 0 else 0.0
-        print(f" - {ds}: #samples {cnt}, harmful rate {rate:.3f} ({harmful_cnt}/{cnt}), precision {prec_ds:.3f}")
-
-
 # Threshold 
 def apply_threshold(probs: np.ndarray, threshold: float) -> np.ndarray:
     return (probs >= threshold).astype(np.int32)
-
 
 # Model Definition: Linear Probe Classifier
 class LinearProbeClassifier(nn.Module):

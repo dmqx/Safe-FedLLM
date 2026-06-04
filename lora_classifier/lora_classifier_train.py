@@ -1,15 +1,17 @@
 import argparse
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, get_origin, get_args
+from typing import Optional, get_origin, get_args
+
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
-from dataclasses import dataclass
+
 from lora_classifier_common import (
     get_label_map,
     setup_logging, validate_dataset_dir, get_device,
-    load_state_dicts, find_param_files, detect_first_layer_index,
+    load_state_dicts, find_param_files, get_first_layer_idx,
     apply_filter_policy, get_ordered_keys_and_sizes, apply_threshold,
     build_feature_matrix, apply_normalization, generate_labels,
     LinearProbeClassifier, save_classifier, calculate_metrics
@@ -18,7 +20,6 @@ from lora_classifier_common import (
 # CLI 
 @dataclass
 class ClassifierConfig:
-    
     normalize: str = "l2"
     epochs: int = 100
     lr: float = 0.01
@@ -29,7 +30,7 @@ class ClassifierConfig:
     val_split: float = 0.1
     threshold: float = 0.8
 
-    filter_policy: str = "first_layer_B_only"
+    filter_policy: str = "first_B"  # all_layers , first_B
     use_intersection_keys: bool = False
     max_samples: Optional[int] = None
     max_workers: int = 4
@@ -37,12 +38,8 @@ class ClassifierConfig:
 
     @classmethod
     def from_args(cls, args) -> "ClassifierConfig":
-        config_dict = {}
-        for field in cls.__dataclass_fields__.keys():
-            if hasattr(args, field):
-                value = getattr(args, field)
-                config_dict[field] = value
-        return cls(**config_dict)
+        return cls(**{f: getattr(args, f) for f in cls.__dataclass_fields__ if hasattr(args, f)})
+
 
 # Main Training
 def config_arguments(parser: argparse.ArgumentParser, default: ClassifierConfig):
@@ -76,7 +73,7 @@ def load_data(train_dir: str, max_samples: Optional[int], max_workers: int):
     return state_dicts, y_np, ds_labels, pairs
 
 def build_features(state_dicts, config: "ClassifierConfig"):
-    first_layer_idx = detect_first_layer_index(state_dicts)
+    first_layer_idx = get_first_layer_idx(state_dicts)
     filtered_state_dicts = apply_filter_policy(state_dicts, first_layer_idx, config.filter_policy)
     ordered_keys, key_sizes, use_intersection, total_dim = get_ordered_keys_and_sizes(
         filtered_state_dicts, config.use_intersection_keys
@@ -85,7 +82,7 @@ def build_features(state_dicts, config: "ClassifierConfig"):
     X_params_np = apply_normalization(X_params_np, config.normalize)
     X_feat_np = X_params_np.astype(np.float32)
     X_feat_np = np.nan_to_num(X_feat_np, nan=0.0, posinf=1e6, neginf=-1e6)
-    return X_feat_np, ordered_keys, key_sizes, int(first_layer_idx), config.normalize, bool(use_intersection), int(total_dim)
+    return X_feat_np, ordered_keys, key_sizes, int(first_layer_idx), bool(use_intersection), int(total_dim)
 
 def split_data(X_feat_np: np.ndarray, y_np: np.ndarray, val_split: float):
     X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
@@ -134,14 +131,11 @@ def evaluate(model: torch.nn.Module, X_feat_np: np.ndarray, y_train: np.ndarray,
     train_precision = float(metrics["precision"])
     return train_precision
 
-def save_model(output_path: str, classifier_data: Dict):
-    save_classifier(classifier_data, output_path)
-
 def train_classifier(train_dir: str, output_path: str, config: "ClassifierConfig") -> None:
     logger = setup_logging()
     device = get_device(config.gpu)
     state_dicts, y_np, ds_labels, pairs = load_data(train_dir, config.max_samples, config.max_workers)
-    X_feat_np, ordered_keys, key_sizes, layer_idx, norm, use_intersection, total_dim = build_features(state_dicts, config)
+    X_feat_np, ordered_keys, key_sizes, layer_idx, use_intersection, total_dim = build_features(state_dicts, config)
     logger.info(f"Total parameter dimension (B-only): {total_dim} | Using intersection keys: {use_intersection}")
     logger.info(f"Feature matrix shape: {X_feat_np.shape}")
     X_train_np, y_train_np, X_val_np, y_val_np, y_train = split_data(X_feat_np, y_np, config.val_split)
@@ -161,7 +155,7 @@ def train_classifier(train_dir: str, output_path: str, config: "ClassifierConfig
         "label_map": label_map,
         "linear_probe_model": model.cpu()
     }
-    save_model(output_path, classifier_data)
+    save_classifier(classifier_data, output_path)
     logger.info(f"Training completed -> model type: linear_probe, samples: {len(state_dicts)}, dimension: {X_feat_np.shape[1]}")
 
 def main():
@@ -169,7 +163,7 @@ def main():
     parser = argparse.ArgumentParser(description="Training script for a LoRA-parameter linear probe classifier")
     script_dir = Path(__file__).resolve().parent
 
-    parser.add_argument("--train_dir", type=str, default=str(script_dir / "classifier-train"))
+    parser.add_argument("--train_dir", type=str, default=str(script_dir / ""))
     parser.add_argument("--output_path", type=str, default=str(script_dir / "lora_classifier.pt"))
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--validate_only", action="store_true")
