@@ -41,8 +41,22 @@ bash run_sft_example.sh
 
 Safe-FedLLM supports four defense modules:
 
+- **none**: No defense.
 - **step-level**:  Defense based on each training step.
 - **client-level**: Defense based on the final training step.
 - **shadow-level**: Stable defense with a shadow LoRA branch for drift resilience.
-- **none**: No defense.
+- **evidence-level**: Efficient defense using evidence from the shadow LoRA branch.
+
+## Citation
+
+Please cite our paper if you find the repository helpful.
+
+```bibtex
+@article{2026Safe-FedLLM,
+  title   = {Safe-FedLLM: Delving into the Safety of Federated Large Language Models},
+  author  = {Mingxiang Tao and Yu Tian and Wenxuan Tu and Yue Yang and Xue Yang and Xiangyan Tang},
+  journal = {arXiv preprint arXiv:2601.07177},
+  year    = {2026}
+}
+```
 
