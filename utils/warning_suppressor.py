@@ -28,7 +28,6 @@ def setup_logging(log_level=logging.INFO):
         format='%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    
     logging.getLogger("transformers").setLevel(logging.WARNING)
     logging.getLogger("datasets").setLevel(logging.WARNING)
     logging.getLogger("accelerate").setLevel(logging.WARNING)
